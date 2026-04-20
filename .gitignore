@@ -1,0 +1,16 @@
+# Security
+.env
+
+# Python Caches
+__pycache__/
+*.py[cod]
+
+# App Data
+boards/
+*.draw
+sticky_notes.json
+crash_log.txt
+
+# IDEs
+.idea/
+.vscode/
