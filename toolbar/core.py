@@ -7,11 +7,12 @@ import math
 # 2. Third-Party Library Imports
 import keyboard
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QComboBox,
-                             QPushButton, QSystemTrayIcon, QMenu, QVBoxLayout)
+                             QPushButton, QSystemTrayIcon, QMenu, QVBoxLayout,
+                             QInputDialog, QMessageBox)
 from PyQt6.QtGui import (QColor, QKeySequence, QShortcut, QPainter, QPixmap,
                          QPainterPath, QPolygonF, QCursor, QBrush,
                          QRadialGradient, QLinearGradient, QPen)
-from PyQt6.QtCore import Qt, QRect, QSize, QTimer, QPropertyAnimation, pyqtSignal, QObject, QPointF, QPoint
+from PyQt6.QtCore import Qt, QRect, QSize, QTimer, QPropertyAnimation, pyqtSignal, QObject, QPointF, QPoint, QSettings
 
 # 3. Local Application Imports
 from windows import MiniBoard, LoadWindow, AIWindow
@@ -19,6 +20,7 @@ from utils import B
 from storage import save_sticky_notes, load_sticky_notes
 from .icons import get_icon
 from .components import ColorRing, Popup, HoverButton, ShapeTrigger, StickyNote, Header
+from network import NetworkManager, LiveNetworkManager
 
 
 class GlobalSignals(QObject):
@@ -73,15 +75,12 @@ class Toolbar(QWidget):
         tm.setStyleSheet(
             "QMenu{background:#2D2D2D; color:#DDD; border:1px solid #444} QMenu::item{padding:8px 20px} QMenu::item:selected{background:#007ACC; color:white}")
 
-        # --- NEW: Add the Hide/Show button and a divider line ---
         tm.addAction("Hide / Show App", self.toggle_canvas)
         tm.addSeparator()
-
         tm.addAction("Quit App", sys.exit)
         self.tray.setContextMenu(tm)
         self.tray.show()
 
-        # --- BONUS: Double-click the tray icon to quickly show/hide ---
         self.tray.activated.connect(
             lambda reason: self.toggle_canvas() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
 
@@ -95,8 +94,6 @@ class Toolbar(QWidget):
 
         self.header = Header(self)
         self.header.setParent(self)
-
-        # --- THE FIX: Force the Header to treat double-clicks exactly like a normal click ---
         self.header.mouseDoubleClickEvent = self.header.mousePressEvent
 
         self.size_badge = QLabel(str(self.w), self)
@@ -191,13 +188,72 @@ class Toolbar(QWidget):
             b = make_emoji_btn(i, tip, lambda *_, tool=m: self.set_tool(tool), size=32)
             self.shape_btns.append(b)
 
-        # RIGHT BUTTONS
+        # NETWORK INIT & RIGHT BUTTONS
+        self.settings = QSettings("ScreenDrawAI", "Profile")
+
+        # --- BOTH ENGINES INITIALIZED ---
+        self.net = NetworkManager()  # Engine 1: Firebase (Version Control)
+        self.live_net = LiveNetworkManager()  # Engine 2: WebSockets (Real-time Cloud)
+
+        # Connect the live socket to ALL canvases (Main Screen AND Popup Boards)
+        def route_live_point(data):
+            if self.c.isVisible():
+                self.c.handle_live_point(data)
+            for b in self.boards:
+                if b.isVisible():
+                    b.c.handle_live_point(data)
+
+        self.live_net.point_received.connect(route_live_point)
+
+        # Check if they have a saved username in their OS registry
+        saved_id = self.settings.value("username", "")
+        if saved_id:
+            self.net.user_id = saved_id
+            self.live_net.user_id = saved_id
+            display_name = saved_id
+        else:
+            display_name = "Not Set"
+
         self.btn_new = make_emoji_btn("🪟", "New Window", lambda *_: self.add_board('new'))
         self.btn_save = make_emoji_btn("💾", "Save Board", self.save_current_board)
         self.btn_note = make_emoji_btn("📝", "New Sticky Note", self.spawn_note)
         self.btn_load = make_emoji_btn("📂", "Load Saved", self.toggle_load_window)
 
-        self.right_btns = [self.btn_new, self.btn_save, self.btn_note, self.btn_load]
+        self.net_menu = Popup(self)
+        for label, cb in [
+            ("📤 Send to Student", self.handle_send_inbox),
+            ("📥 Check Inbox", self.handle_check_inbox),
+            ("🌍 Host Study Room", self.handle_host_room),
+            ("🔗 Join Study Room", self.handle_join_room),
+            ("⚙️ Change Username", self.handle_change_username)
+        ]:
+            b = B(f" {label}", cb, style="color:#DDD; border:none; font-size:14px; text-align:left; padding-left:10px")
+            self.net_menu.layout.addWidget(b)
+
+        self.hb_net = HoverButton("share", self.net_menu, self, f"Network (ID: {display_name})")
+        self.hover_btns.append(self.hb_net)
+
+        self.right_btns = [self.btn_new, self.btn_save, self.btn_note, self.btn_load, self.hb_net]
+
+        # --- PHASE 5: PERSISTENT ROOM UI ON THE CANVAS ---
+        self.room_ui = QPushButton("Not Connected", self.c)
+        self.room_ui.setStyleSheet(
+            "background: rgba(30, 30, 30, 0.85); color: white; border: 2px solid #007ACC; border-radius: 10px; padding: 8px; font-weight: bold; font-size: 14px;")
+        self.room_ui.move(20, 20)
+        self.room_ui.resize(220, 50)
+        self.room_ui.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.room_ui.hide()
+
+        self.room_menu = QMenu(self.room_ui)
+        self.room_menu.setStyleSheet(
+            "QMenu{background:#2D2D2D; color:#DDD;} QMenu::item{padding:8px 20px;} QMenu::item:selected{background:#007ACC;}")
+        self.room_menu.addAction("📋 Copy Room Code", lambda: QApplication.clipboard().setText(self.live_net.room_code))
+        self.room_menu.addAction("🚪 Leave Room", self.handle_leave_room)
+        self.action_close_room = self.room_menu.addAction("🛑 Close Room (Kick All)", self.handle_close_room)
+        self.room_ui.setMenu(self.room_menu)
+
+        # Connect the new system signal for Host Migration
+        self.live_net.system_event.connect(self.handle_system_event)
 
         # INITIALIZE ALL POSITIONS
         all_buttons = self.left_btns + self.center_btns + self.right_btns + self.shape_btns
@@ -262,7 +318,6 @@ class Toolbar(QWidget):
         self.save_timer.timeout.connect(self.save_all_notes)
         self.save_timer.start(3000)
 
-    # --- THE FIX: Swallow rogue double clicks on the transparent toolbar background ---
     def mouseDoubleClickEvent(self, e):
         e.accept()
 
@@ -515,7 +570,6 @@ class Toolbar(QWidget):
     def toggle_canvas(self, *_):
         state = not self.c.isVisible()
 
-        # --- NEW: If we are showing the app, instantly snap the toolbar to the center of the screen ---
         if state:
             screens = QApplication.screens()
             idx = self.cb.currentIndex()
@@ -523,7 +577,6 @@ class Toolbar(QWidget):
                 s = screens[idx]
                 cx = s.geometry().center().x()
                 cy = s.geometry().center().y()
-                # Center it perfectly based on its current size (whether expanded or minimized)
                 self.move(int(cx - self.width() / 2), int(cy - self.height() / 2))
 
         self.c.setVisible(state)
@@ -761,7 +814,6 @@ class Toolbar(QWidget):
         if target_y < s.top(): target_y = s.top() + 10
 
         new_note = StickyNote(self, target_x, target_y, w, h, txt)
-        # --- THE FIX: Patch the Sticky Note header as well just in case! ---
         new_note.h.mouseDoubleClickEvent = new_note.h.mousePressEvent
         self.notes.append(new_note)
 
@@ -826,3 +878,171 @@ class Toolbar(QWidget):
         self.load_win.move(target_x, target_y)
         self.load_win.show()
         self.load_win.raise_()
+
+    # ==========================================
+    # --- PHASE 3 & 4: NETWORK ACTIONS ENGINE ---
+    # ==========================================
+
+    def require_username(self):
+        if not self.net.user_id:
+            return self.handle_change_username(is_initial_setup=True)
+        return True
+
+    def handle_change_username(self, *_, is_initial_setup=False):
+        self.net_menu.hide()
+        current = self.net.user_id if self.net.user_id else ""
+        title = "Welcome!" if is_initial_setup else "Change Username"
+        prompt = "Choose your display name before connecting:" if is_initial_setup else "Enter your new display name:"
+
+        name, ok = QInputDialog.getText(self, title, prompt, text=current)
+
+        if ok and name.strip():
+            self.net.user_id = name.strip()
+            self.live_net.user_id = name.strip()
+
+            self.settings.setValue("username", self.net.user_id)
+            self.hb_net.setToolTip(f"Network (ID: {self.net.user_id})")
+
+            if not is_initial_setup:
+                QMessageBox.information(self, "Success", f"Username updated to: {self.net.user_id}")
+            return True
+        return False
+
+    def handle_send_inbox(self, *_):
+        self.net_menu.hide()
+        if not self.require_username(): return
+
+        target, ok = QInputDialog.getText(self, "Send Board", "Enter Student's ID:")
+        if ok and target:
+            board_data = self.safe_active.export_to_json()
+            success, msg = self.net.send_to_inbox(target, board_data)
+            QMessageBox.information(self, "Network", msg)
+
+    def handle_check_inbox(self, *_):
+        self.net_menu.hide()
+        if not self.require_username(): return
+
+        inbox_data = self.net.check_inbox()
+        if inbox_data:
+            self.add_board('new')
+            new_board = self.boards[-1]
+            success = new_board.c.import_from_json(inbox_data['board_data'])
+            if success:
+                QMessageBox.information(self, "Inbox", f"📬 Board received from {inbox_data['sender']}!")
+            else:
+                QMessageBox.warning(self, "Error", "Failed to render the received board.")
+        else:
+            QMessageBox.information(self, "Inbox", "Your inbox is currently empty.")
+
+    def handle_host_room(self, *_):
+        self.net_menu.hide()
+        if not self.require_username(): return
+
+        board_data = self.safe_active.export_to_json()
+        code = self.net.host_study_room(board_data)
+
+        if code:
+            self.live_net.connect_to_room(code)
+
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Study Room Hosted")
+            msg.setText(f"Your Room Code is:  {code}  \n\nGive this to your group to instantly sync this board!")
+            msg.exec()
+        else:
+            QMessageBox.warning(self, "Error", "Failed to host room. Check your internet connection.")
+
+    def handle_join_room(self, *_):
+        self.net_menu.hide()
+        if not self.require_username(): return
+
+        code, ok = QInputDialog.getText(self, "Join Room", "Enter 6-digit Room Code:")
+
+        if ok and code:
+            room_data = self.net.join_study_room(code)
+
+            if room_data:
+                versions = list(room_data.keys())
+                selected_version = versions[0]
+
+                if len(versions) > 1:
+                    if "Original_Board" in versions:
+                        versions.remove("Original_Board")
+                        versions.insert(0, "Original_Board")
+
+                    item, ok = QInputDialog.getItem(self, "Select Version",
+                                                    f"Room {code} has updates! Choose a board to load:", versions, 0,
+                                                    False)
+                    if ok and item:
+                        selected_version = item
+                    else:
+                        return
+
+                data_to_load = room_data[selected_version].get("data")
+
+                self.add_board('new')
+                new_board = self.boards[-1]
+                new_board.c.import_from_json(data_to_load)
+
+                self.live_net.connect_to_room(code)
+
+                btn_share = QPushButton(f"📤 Push Edit to Room {code}", new_board)
+                btn_share.setStyleSheet(
+                    "background: #007ACC; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
+                btn_share.resize(220, 35)
+                btn_share.move(new_board.width() - 230, 40)
+                btn_share.show()
+
+                def push_update():
+                    updated_json = new_board.c.export_to_json()
+                    success = self.net.submit_revision(code, updated_json)
+                    if success:
+                        btn_share.setText("✅ Update Pushed!")
+                        btn_share.setStyleSheet(
+                            "background: #28a745; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
+                        QMessageBox.information(new_board, "Success", "Your edits were successfully added to the room!")
+                    else:
+                        QMessageBox.warning(new_board, "Error", "Failed to upload update to Firebase.")
+
+                btn_share.clicked.connect(push_update)
+                QMessageBox.information(self, "Success", f"Loaded '{selected_version}' successfully!")
+            else:
+                QMessageBox.warning(self, "Error", "Invalid code or the room has expired.")
+
+    # ==========================================
+    # --- PHASE 5: HOST MIGRATION & ROOM CONTROL ---
+    # ==========================================
+
+    def handle_system_event(self, data):
+        event_type = data.get("type")
+
+        if event_type == "host_update":
+            host = data.get("host")
+            is_me = (host == self.net.user_id)
+
+            self.action_close_room.setVisible(is_me)
+
+            status = "👑 You are Host" if is_me else f"Host: {host}"
+            self.room_ui.setText(f"🌍 Room: {self.live_net.room_code} \n{status}")
+
+            if is_me:
+                self.room_ui.setStyleSheet(
+                    "background: rgba(0, 122, 204, 0.9); color: white; border: 2px solid #FFF; border-radius: 10px; padding: 4px; font-weight: bold; font-size: 12px;")
+            else:
+                self.room_ui.setStyleSheet(
+                    "background: rgba(40, 40, 40, 0.9); color: #AAA; border: 2px solid #555; border-radius: 10px; padding: 4px; font-weight: bold; font-size: 12px;")
+
+            self.room_ui.show()
+
+        elif event_type == "room_closed":
+            self.live_net.disconnect_from_room()
+            self.room_ui.hide()
+            QMessageBox.information(self, "Room Closed", "The host has permanently closed this study room.")
+
+    def handle_leave_room(self):
+        self.live_net.disconnect_from_room()
+        self.room_ui.hide()
+        QMessageBox.information(self, "Disconnected", "You have left the study room.")
+
+    def handle_close_room(self):
+        self.live_net.close_room_globally()
+        self.handle_leave_room()

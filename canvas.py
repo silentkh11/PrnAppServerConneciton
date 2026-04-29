@@ -1,8 +1,10 @@
 import math
+import json
+import base64
 from PyQt6.QtWidgets import QWidget, QApplication
 from PyQt6.QtGui import QPainter, QPen, QColor, QPainterPath, QPolygonF, QCursor, QPainterPathStroker, QPixmap, \
     QPolygon, QEnterEvent, QShortcut, QKeySequence, QDrag
-from PyQt6.QtCore import Qt, QPointF, QRectF, QPoint, QRect, QMimeData, QByteArray
+from PyQt6.QtCore import Qt, QPointF, QRectF, QPoint, QRect, QMimeData, QByteArray, QBuffer, QIODevice, QTimer
 
 
 class CanvasWidget(QWidget):
@@ -41,9 +43,42 @@ class CanvasWidget(QWidget):
         self.cross_drag_start_pos = None
         self.cross_drag_strokes = []
 
+        self.live_trackers = {}  # Tracks active incoming strokes from other users
+
+        # Cursor Size Preview Timer
+        self.showing_size_preview = False
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self.hide_size_preview)
+
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-    # --- NEW: The Smoothing Engine ---
+    # --- PHASE 4: LIVE WEBSOCKET RECEIVER ---
+    def handle_live_point(self, data):
+        uid = data['user_id']
+        is_new = data['is_new_stroke']
+
+        if not hasattr(self, 'live_trackers'):
+            self.live_trackers = {}
+
+        if is_new or uid not in self.live_trackers:
+            new_stroke = {
+                'tool': data['tool'],
+                'c': QColor(data['color']),
+                'w': data['width'],
+                'p': [QPointF(data['x'], data['y'])]
+            }
+            self.strokes.append(new_stroke)
+            self.live_trackers[uid] = new_stroke
+        else:
+            self.live_trackers[uid]['p'].append(QPointF(data['x'], data['y']))
+
+        self.update()
+
+    def hide_size_preview(self):
+        self.showing_size_preview = False
+        self.update_cursor()
+
     def build_path(self, pts):
         path = QPainterPath()
         if not pts: return path
@@ -52,29 +87,33 @@ class CanvasWidget(QWidget):
         if len(pts) < 3:
             for p in pts[1:]: path.lineTo(p)
         else:
-            # Draw a line to the very first midpoint
             p0, p1 = pts[0], pts[1]
             path.lineTo(QPointF((p0.x() + p1.x()) / 2, (p0.y() + p1.y()) / 2))
 
-            # Chain quadratic curves through all the other midpoints
             for i in range(1, len(pts) - 1):
                 p1, p2 = pts[i], pts[i + 1]
                 mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
                 path.quadTo(p1, mid)
 
-            # Finish the stroke exactly at your mouse tip
             path.lineTo(pts[-1])
 
         return path
 
     def enterEvent(self, event):
-        self.setFocus()
+        # Force the OS to give this window keyboard focus instantly
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
         if hasattr(self, 'tb') and self.tb:
             self.tb.active = self
         super().enterEvent(event)
 
     def keyPressEvent(self, e):
-        if (e.modifiers() & Qt.KeyboardModifier.ControlModifier) and e.key() == Qt.Key.Key_V:
+        # Explicitly catch the Escape key when the Canvas has focus
+        if e.key() == Qt.Key.Key_Escape:
+            if hasattr(self, 'tb') and self.tb:
+                self.tb.set_tool('cursor')
+        elif (e.modifiers() & Qt.KeyboardModifier.ControlModifier) and e.key() == Qt.Key.Key_V:
             self.paste_image()
         else:
             super().keyPressEvent(e)
@@ -148,53 +187,76 @@ class CanvasWidget(QWidget):
         if not hasattr(self, 'tb') or not self.tb: return
         t = force_tool if force_tool else self.tb.tool
 
+        w = getattr(self.tb, 'w', 5) * self.scale
+
         if t == 'cursor':
             self.setCursor(Qt.CursorShape.ArrowCursor)
+
         elif t == 'eraser':
-            pm = QPixmap(24, 24);
-            pm.fill(Qt.GlobalColor.transparent);
-            qp = QPainter(pm)
-            qp.setRenderHint(QPainter.RenderHint.Antialiasing);
-            qp.setPen(QPen(QColor(0, 0, 0, 180), 2))
-            qp.setBrush(QColor(255, 255, 255, 80));
-            qp.drawEllipse(2, 2, 20, 20);
-            qp.end()
-            self.setCursor(QCursor(pm, 12, 12))
-        elif t == 'pen':
-            c = getattr(self.tb, 'col', QColor('#FF4B4B'))
-            pm = QPixmap(32, 32);
-            pm.fill(Qt.GlobalColor.transparent);
+            actual_w = w + 10
+            r = actual_w / 2
+            pm_size = int(actual_w + 4)
+            pm = QPixmap(pm_size, pm_size)
+            pm.fill(Qt.GlobalColor.transparent)
             qp = QPainter(pm)
             qp.setRenderHint(QPainter.RenderHint.Antialiasing)
-            qp.setPen(QPen(QColor("#999"), 1));
-            qp.setBrush(QColor(c))
-            qp.drawPolygon(QPolygon([QPoint(0, 0), QPoint(8, 2), QPoint(2, 8)]))
-            qp.setPen(QPen(QColor("#3E2723"), 1));
-            qp.setBrush(QColor("#795548"))
-            qp.drawPolygon(QPolygon([QPoint(2, 8), QPoint(8, 2), QPoint(20, 14), QPoint(14, 20)]))
-            qp.setBrush(QColor("#3E2723"));
-            qp.drawPolygon(QPolygon([QPoint(14, 20), QPoint(20, 14), QPoint(24, 18), QPoint(18, 24)]))
-            qp.end();
-            self.setCursor(QCursor(pm, 0, 0))
-        elif t in ['laser', 'highlighter', 'ai_scanner']:
-            color = QColor("#BB86FC") if t == 'ai_scanner' else getattr(self.tb, 'col', QColor('#FF4B4B'))
-            pm = QPixmap(16, 16);
-            pm.fill(Qt.GlobalColor.transparent);
-            qp = QPainter(pm)
-            qp.setRenderHint(QPainter.RenderHint.Antialiasing);
-            qp.setPen(QPen(QColor(255, 255, 255, 255), 2))
-            qp.setBrush(QColor(color));
-            qp.drawEllipse(3, 3, 10, 10);
+
+            center_pt = QPointF(pm_size / 2, pm_size / 2)
+            qp.setPen(QPen(QColor(0, 0, 0, 180), 2))
+            qp.setBrush(QColor(255, 255, 255, 80))
+            qp.drawEllipse(center_pt, r, r)
             qp.end()
-            self.setCursor(QCursor(pm, 8, 8))
+            self.setCursor(QCursor(pm, int(center_pt.x()), int(center_pt.y())))
+
+        elif t in ['pen', 'laser', 'highlighter', 'ai_scanner']:
+            c = QColor("#BB86FC") if t == 'ai_scanner' else getattr(self.tb, 'col', QColor('#FF4B4B'))
+
+            actual_w = w
+            if t == 'highlighter':
+                actual_w = w * 4
+            elif t == 'ai_scanner':
+                actual_w = 20
+
+            r = actual_w / 2
+            pm_size = int(max(actual_w + 4, r + 30))
+            pm = QPixmap(pm_size, pm_size)
+            pm.fill(Qt.GlobalColor.transparent)
+            qp = QPainter(pm)
+            qp.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            center_pt = QPointF(r + 2, r + 2)
+
+            if getattr(self, 'showing_size_preview', False):
+                qp.setPen(QPen(QColor(255, 255, 255, 180), 1))
+                qp.setBrush(QColor(c.red(), c.green(), c.blue(), 50))
+                qp.drawEllipse(center_pt, r, r)
+
+            qp.translate(center_pt)
+            if t in ['pen', 'highlighter']:
+                qp.setPen(QPen(QColor("#999"), 1))
+                qp.setBrush(QColor(c))
+                qp.drawPolygon(QPolygon([QPoint(0, 0), QPoint(8, 2), QPoint(2, 8)]))
+                qp.setPen(QPen(QColor("#3E2723"), 1))
+                qp.setBrush(QColor("#795548"))
+                qp.drawPolygon(QPolygon([QPoint(2, 8), QPoint(8, 2), QPoint(20, 14), QPoint(14, 20)]))
+                qp.setBrush(QColor("#3E2723"))
+                qp.drawPolygon(QPolygon([QPoint(14, 20), QPoint(20, 14), QPoint(24, 18), QPoint(18, 24)]))
+            else:
+                qp.setPen(QPen(QColor(255, 255, 255, 255), 2))
+                qp.setBrush(QColor(c))
+                qp.drawEllipse(QPointF(0, 0), 4, 4)
+
+            qp.end()
+            self.setCursor(QCursor(pm, int(center_pt.x()), int(center_pt.y())))
+
         else:
             self.setCursor(Qt.CursorShape.CrossCursor)
 
     def delete_all(self):
         if self.strokes:
             self.save_state()
-            self.strokes.clear();
-            self.sel.clear();
+            self.strokes.clear()
+            self.sel.clear()
             self.update()
 
     def delete_selected(self):
@@ -202,7 +264,7 @@ class CanvasWidget(QWidget):
             self.save_state()
             for s in self.sel:
                 if s in self.strokes: self.strokes.remove(s)
-            self.sel.clear();
+            self.sel.clear()
             self.update()
         else:
             self.delete_all()
@@ -273,7 +335,11 @@ class CanvasWidget(QWidget):
             m = e.position()
             self.pan_x = m.x() - (m.x() - self.pan_x) * (self.scale / old_scale)
             self.pan_y = m.y() - (m.y() - self.pan_y) * (self.scale / old_scale)
+
+            self.showing_size_preview = True
+            self.update_cursor()
             self.update()
+            self.preview_timer.start(800)
         else:
             if hasattr(self, 'tb') and self.tb:
                 drawing_tools = ['pen', 'highlighter', 'laser', 'eraser', 'rect', 'circle', 'line', 'arrow']
@@ -285,7 +351,11 @@ class CanvasWidget(QWidget):
                         self.tb.w = max(1, self.tb.w - 1)
 
                     self.tb.update_width_display()
+
+                    self.showing_size_preview = True
+                    self.update_cursor()
                     self.update()
+                    self.preview_timer.start(800)
 
     def mousePressEvent(self, e):
         self.setFocus()
@@ -402,21 +472,26 @@ class CanvasWidget(QWidget):
             tool = 'lasso'
 
         elif e.button() == Qt.MouseButton.RightButton:
-            tool = 'eraser';
+            tool = 'eraser'
             self.update_cursor(force_tool='eraser')
 
         if tool != 'lasso' and self.sel:
-            self.sel = [];
+            self.sel = []
             self.update()
 
         if tool == 'eraser':
-            self.erasing_session = False;
-            self.erase_at(pos);
+            self.erasing_session = False
+            self.erase_at(pos)
             return
 
         self.save_state()
         self.current_stroke = {'tool': tool, 'c': self.tb.col, 'w': self.tb.w, 'p': [pos]}
-        self.strokes.append(self.current_stroke);
+        self.strokes.append(self.current_stroke)
+
+        # --- PHASE 4: Broadcast initial click to live server ---
+        if hasattr(self, 'tb') and hasattr(self.tb, 'live_net') and getattr(self.tb.live_net, 'is_connected', False):
+            self.tb.live_net.send_draw_point(tool, pos.x(), pos.y(), self.tb.col.name(), self.tb.w, True)
+
         self.update()
 
     def mouseMoveEvent(self, e):
@@ -447,9 +522,9 @@ class CanvasWidget(QWidget):
                         min_x, min_y = min(min_x, pt.x()), min(min_y, pt.y())
                         max_x, max_y = max(max_x, pt.x()), max(max_y, pt.y())
 
-            min_x -= 10;
-            min_y -= 10;
-            max_x += 10;
+            min_x -= 10
+            min_y -= 10
+            max_x += 10
             max_y += 10
             w = max(1, max_x - min_x) * self.scale
             h = max(1, max_y - min_y) * self.scale
@@ -485,10 +560,10 @@ class CanvasWidget(QWidget):
 
         if self.is_panning and self.last_pan_pos:
             delta = e.position() - self.last_pan_pos
-            self.pan_x += delta.x();
+            self.pan_x += delta.x()
             self.pan_y += delta.y()
-            self.last_pan_pos = e.position();
-            self.update();
+            self.last_pan_pos = e.position()
+            self.update()
             return
 
         if self.is_resizing and self.move_start_pos and self.sel:
@@ -543,6 +618,12 @@ class CanvasWidget(QWidget):
         pos = self.map_pos(e.position())
         if self.current_stroke['tool'] in ['pen', 'highlighter', 'laser', 'lasso']:
             self.current_stroke['p'].append(pos)
+
+            # --- PHASE 4: Broadcast active dragging motion to live server ---
+            if hasattr(self, 'tb') and hasattr(self.tb, 'live_net') and getattr(self.tb.live_net, 'is_connected',
+                                                                                False):
+                self.tb.live_net.send_draw_point(self.current_stroke['tool'], pos.x(), pos.y(), self.tb.col.name(),
+                                                 self.tb.w, False)
         else:
             if len(self.current_stroke['p']) > 1:
                 self.current_stroke['p'][1] = pos
@@ -558,8 +639,8 @@ class CanvasWidget(QWidget):
             return
 
         if self.is_panning:
-            self.is_panning = False;
-            self.update_cursor();
+            self.is_panning = False
+            self.update_cursor()
             return
 
         if self.is_resizing:
@@ -634,8 +715,8 @@ class CanvasWidget(QWidget):
                 self.sel = [s for s in self.strokes if
                             any(poly.containsPoint(pt, Qt.FillRule.OddEvenFill) for pt in s.get('p', []))]
 
-        self.update_cursor();
-        self.current_stroke = None;
+        self.update_cursor()
+        self.current_stroke = None
         self.update()
 
     def erase_at(self, pos):
@@ -649,8 +730,8 @@ class CanvasWidget(QWidget):
             if s['tool'] == 'rect' and len(s['p']) > 1:
                 path.addRect(QRectF(s['p'][0], s['p'][-1]))
             elif s['tool'] == 'circle' and len(s['p']) > 1:
-                p1, p2 = s['p'][0], s['p'][-1];
-                r = math.hypot(p2.x() - p1.x(), p2.y() - p1.y());
+                p1, p2 = s['p'][0], s['p'][-1]
+                r = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
                 path.addEllipse(p1, r, r)
             elif s['tool'] in ['line', 'arrow'] and len(s['p']) > 1:
                 path.moveTo(s['p'][0])
@@ -658,7 +739,7 @@ class CanvasWidget(QWidget):
             else:
                 path = self.build_path(s['p'])
 
-            stk = QPainterPathStroker();
+            stk = QPainterPathStroker()
             stk.setWidth(s['w'] + 10)
             if stk.createStroke(path).intersects(rect): to_rem.append(s)
 
@@ -670,27 +751,27 @@ class CanvasWidget(QWidget):
             self.update()
 
     def paintEvent(self, e):
-        qp = QPainter(self);
-        qp.setRenderHint(QPainter.RenderHint.Antialiasing);
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.paint_strokes(qp)
 
     def paint_strokes(self, qp):
-        qp.save();
-        qp.translate(self.pan_x, self.pan_y);
+        qp.save()
+        qp.translate(self.pan_x, self.pan_y)
         qp.scale(self.scale, self.scale)
         pat = getattr(self.tb, 'bg_pattern', 'none') if hasattr(self, 'tb') and self.tb else 'none'
         if pat != 'none':
-            t, _ = qp.transform().inverted();
+            t, _ = qp.transform().inverted()
             r = t.mapRect(QRectF(self.rect()))
             sx, sy, ex, ey = int(r.left() // 40) * 40, int(r.top() // 40) * 40, int(r.right()) + 40, int(
                 r.bottom()) + 40
             if pat == 'grid':
-                qp.setPen(QPen(QColor(0, 150, 255, 50), 1));
-                [qp.drawLine(x, sy, x, ey) for x in range(sx, ex, 40)];
+                qp.setPen(QPen(QColor(0, 150, 255, 50), 1))
+                [qp.drawLine(x, sy, x, ey) for x in range(sx, ex, 40)]
                 [qp.drawLine(sx, y, ex, y) for y in range(sy, ey, 40)]
             elif pat == 'dots':
-                qp.setPen(Qt.PenStyle.NoPen);
-                qp.setBrush(QColor(0, 150, 255, 70));
+                qp.setPen(Qt.PenStyle.NoPen)
+                qp.setBrush(QColor(0, 150, 255, 70))
                 [qp.drawEllipse(QPointF(x, y), 2, 2) for x in range(sx, ex, 40) for y in range(sy, ey, 40)]
 
         for s in self.strokes: self.draw_stroke(qp, s)
@@ -726,24 +807,24 @@ class CanvasWidget(QWidget):
                 if t in ['rect', 'ai_scanner']:
                     qp.drawRect(QRectF(p1, p2))
                 elif t == 'circle':
-                    r = math.hypot(p2.x() - p1.x(), p2.y() - p1.y()); qp.drawEllipse(p1, r, r)
+                    r = math.hypot(p2.x() - p1.x(), p2.y() - p1.y());
+                    qp.drawEllipse(p1, r, r)
                 elif t == 'line':
                     qp.drawLine(p1, p2)
                 elif t == 'arrow':
-                    qp.drawLine(p1, p2);
+                    qp.drawLine(p1, p2)
                     ang = math.atan2(p2.y() - p1.y(), p2.x() - p1.x())
                     qp.drawPolygon(QPolygonF([p2, QPointF(p2.x() - 15 * math.cos(ang - math.pi / 6),
                                                           p2.y() - 15 * math.sin(ang - math.pi / 6)),
                                               QPointF(p2.x() - 15 * math.cos(ang + math.pi / 6),
                                                       p2.y() - 15 * math.sin(ang + math.pi / 6))]))
             else:
-                # --- NEW: Use the new smooth curve logic to draw the ink! ---
                 path = self.build_path(pts)
                 qp.drawPath(path)
 
         if t == 'highlighter':
-            col = QColor(c);
-            col.setAlpha(100);
+            col = QColor(c)
+            col.setAlpha(100)
             qp.setPen(QPen(col, w * 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap, Qt.PenJoinStyle.RoundJoin))
             qp.setBrush(Qt.BrushStyle.NoBrush)
         elif t in ['pen', 'laser']:
@@ -756,7 +837,7 @@ class CanvasWidget(QWidget):
             qp.setBrush(Qt.BrushStyle.NoBrush)
         elif t in ['lasso', 'ai_scanner']:
             color = QColor("#BB86FC") if t == 'ai_scanner' else QColor(c)
-            qp.setPen(QPen(color, 2, Qt.PenStyle.DashLine));
+            qp.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
             qp.setBrush(QColor(color.red(), color.green(), color.blue(), 40))
         elif t in ['rect', 'circle', 'line', 'arrow']:
             qp.setPen(QPen(QColor(c), w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
@@ -774,3 +855,73 @@ class CanvasWidget(QWidget):
             qp.setPen(dash_pen)
             qp.setBrush(Qt.BrushStyle.NoBrush)
             trace_shape()
+
+    # --- PHASE 1: JSON EXPORT/IMPORT ENGINE ---
+
+    def export_to_json(self):
+        export_data = []
+        for s in self.strokes:
+            stroke_data = {
+                'tool': s['tool'],
+                'w': s.get('w', 2)
+            }
+
+            if 'c' in s and isinstance(s['c'], QColor):
+                stroke_data['c'] = s['c'].name()
+            else:
+                stroke_data['c'] = "#000000"
+
+            if 'p' in s:
+                stroke_data['p'] = [{'x': pt.x(), 'y': pt.y()} for pt in s['p']]
+
+            if s['tool'] == 'image':
+                rect = s['rect']
+                stroke_data['rect'] = {'x': rect.x(), 'y': rect.y(), 'w': rect.width(), 'h': rect.height()}
+
+                ba = QByteArray()
+                buff = QBuffer(ba)
+                buff.open(QIODevice.OpenModeFlag.WriteOnly)
+                s['pixmap'].save(buff, "PNG")
+                stroke_data['image_b64'] = base64.b64encode(ba.data()).decode('utf-8')
+
+            export_data.append(stroke_data)
+
+        return json.dumps(export_data)
+
+    def import_from_json(self, json_str):
+        try:
+            import_data = json.loads(json_str)
+            new_strokes = []
+
+            for s_data in import_data:
+                stroke = {
+                    'tool': s_data['tool'],
+                    'w': s_data['w'],
+                    'c': QColor(s_data['c'])
+                }
+
+                if 'p' in s_data:
+                    stroke['p'] = [QPointF(pt['x'], pt['y']) for pt in s_data['p']]
+
+                if stroke['tool'] == 'image':
+                    rect_data = s_data['rect']
+                    stroke['rect'] = QRectF(rect_data['x'], rect_data['y'], rect_data['w'], rect_data['h'])
+
+                    b64_data = s_data['image_b64']
+                    ba = QByteArray.fromBase64(b64_data.encode('utf-8'))
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(ba, "PNG")
+                    stroke['pixmap'] = pixmap
+
+                new_strokes.append(stroke)
+
+            self.save_state()
+            self.strokes = new_strokes
+            self.sel = []
+            self.update()
+            print("✅ JSON Board Loaded Successfully!")
+            return True
+
+        except Exception as e:
+            print(f"❌ Failed to parse JSON board: {e}")
+            return False
