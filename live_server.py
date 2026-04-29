@@ -3,6 +3,7 @@ import json
 import websockets
 import os
 
+# Dictionary to store all active rooms and their current state
 ROOMS = {}
 
 
@@ -37,6 +38,7 @@ async def handler(websocket):
                         "clients": {}
                     }
 
+                # Add the new client to the room
                 ROOMS[current_room]["clients"][websocket] = user_id
 
                 # HOST MIGRATION: If original host returns, they take back the crown
@@ -51,6 +53,7 @@ async def handler(websocket):
                 })
 
             elif action in ["draw", "erase"] and current_room:
+                # Route the drawing data to everyone else in the room
                 for client in list(ROOMS[current_room]["clients"].keys()):
                     if client != websocket:
                         try:
@@ -65,12 +68,13 @@ async def handler(websocket):
                     del ROOMS[current_room]
 
             elif action == "ping":
+                # Invisible heartbeat to keep the Render connection alive
                 pass
 
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        # When a user disconnects or exits the app
+        # When a user disconnects, loses WiFi, or exits the app
         if current_room and current_room in ROOMS and websocket in ROOMS[current_room]["clients"]:
             del ROOMS[current_room]["clients"][websocket]
 
@@ -93,8 +97,11 @@ async def handler(websocket):
 
 
 async def main():
+    # Render assigns a dynamic port via environment variables
     port = int(os.environ.get("PORT", 8765))
     print(f"🚀 ScreenDraw Server listening on port {port}...")
+
+    # 0.0.0.0 allows the server to accept external internet connections
     async with websockets.serve(handler, "0.0.0.0", port):
         await asyncio.Future()
 
