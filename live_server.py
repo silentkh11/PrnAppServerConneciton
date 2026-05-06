@@ -52,7 +52,8 @@ async def handler(websocket):
                     "host": ROOMS[current_room]["current_host"]
                 })
 
-            elif action in ["draw", "erase"] and current_room:
+
+            elif action in ["draw", "erase", "undo", "clear"] and current_room:
                 # Route the drawing data to everyone else in the room
                 for client in list(ROOMS[current_room]["clients"].keys()):
                     if client != websocket:
